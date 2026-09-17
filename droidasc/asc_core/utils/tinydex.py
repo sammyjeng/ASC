@@ -9,6 +9,80 @@ _STRUCT_III = struct.Struct('<III')
 _STRUCT_HHI = struct.Struct('<HHI')
 _STRUCT_HHHHII = struct.Struct('<HHHHII')
 
+
+def _decode_mutf8(data, start, utf16_size):
+    data_size = len(data)
+    ascii_end = start + utf16_size
+    if ascii_end < data_size and data[ascii_end] == 0:
+        ascii_data = bytes(data[start:ascii_end])
+        if b'\0' not in ascii_data:
+            try:
+                return ascii_data.decode('ascii')
+            except UnicodeDecodeError:
+                pass
+
+    units = []
+    append = units.append
+    pos = start
+    for _ in range(utf16_size):
+        if pos >= data_size:
+            raise ValueError('string data shorter than utf16_size')
+
+        first = data[pos]
+        pos += 1
+        if first == 0:
+            raise ValueError('string data shorter than utf16_size')
+        if first < 0x80:
+            append(first)
+            continue
+
+        if 0xc0 <= first < 0xe0:
+            if pos >= data_size or data[pos] & 0xc0 != 0x80:
+                raise ValueError('invalid MUTF-8 continuation byte')
+            value = ((first & 0x1f) << 6) | (data[pos] & 0x3f)
+            pos += 1
+            if value != 0 and value < 0x80:
+                raise ValueError('overlong MUTF-8 encoding')
+            append(value)
+            continue
+
+        if 0xe0 <= first < 0xf0:
+            if pos + 1 >= data_size:
+                raise ValueError('truncated MUTF-8 sequence')
+            second = data[pos]
+            third = data[pos + 1]
+            if second & 0xc0 != 0x80 or third & 0xc0 != 0x80:
+                raise ValueError('invalid MUTF-8 continuation byte')
+            value = ((first & 0x0f) << 12) | ((second & 0x3f) << 6) | (third & 0x3f)
+            pos += 2
+            if value < 0x800:
+                raise ValueError('overlong MUTF-8 encoding')
+            append(value)
+            continue
+
+        raise ValueError('invalid MUTF-8 start byte')
+
+    if pos >= data_size:
+        raise ValueError('unterminated string_data_item')
+    if data[pos] != 0:
+        raise ValueError('string data longer than utf16_size')
+
+    chars = []
+    append_char = chars.append
+    pos = 0
+    while pos < utf16_size:
+        unit = units[pos]
+        if 0xd800 <= unit <= 0xdbff and pos + 1 < utf16_size:
+            trailing = units[pos + 1]
+            if 0xdc00 <= trailing <= 0xdfff:
+                append_char(chr(0x10000 + ((unit - 0xd800) << 10) + trailing - 0xdc00))
+                pos += 2
+                continue
+        append_char(chr(unit))
+        pos += 1
+    return ''.join(chars)
+
+
 class DEXHeader:
     def __init__(self, buf):
         # (off, size)
@@ -348,12 +422,11 @@ class DEX:
             return self._strings[str_idx]
 
         str_idx_off = self.header.strings[0]
-        str_size = self.header.strings[1]
         string_off = _STRUCT_I.unpack_from(self.buf, str_idx_off + str_idx * 4)[0]
-        utf16_size, c = read_uleb128_fast(self.buf, string_off)
+        # The length prefix counts UTF-16 code units; encoded bytes end at NUL.
+        utf16_units, c = read_uleb128_fast(self.buf, string_off)
         data_start = string_off + c
-        end = data_start + utf16_size
-        s = bytes(self.buf[data_start:end]).decode('utf-8', errors='replace')
+        s = _decode_mutf8(self.buf, data_start, utf16_units)
         self._strings[str_idx] = s
         return s
 
